@@ -104,5 +104,3 @@ Notes:
 - File permissions: `chmod 600 config.ini` so only the running user can read it.
 - Prefer a SAS token scoped to just the `sipca` container with read/list
   permissions over the full storage account key, if your Azure setup allows it.
-- Rotate the SMTP app password periodically, and immediately if it's ever
-  pasted somewhere outside this config file (chat, ticket, repo, etc).
