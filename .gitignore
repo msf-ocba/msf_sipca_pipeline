@@ -1,0 +1,8 @@
+config.ini
+data/
+logs/
+reports/
+pipeline.lock
+__pycache__/
+*.pyc
+.venv/
