@@ -5,6 +5,9 @@ Reads the status JSON written by 02_sipca_review.py and, if conditions are
 met, emails the report generated in that step. All SMTP credentials and
 recipients come from config.ini — nothing is hardcoded here.
 
+(Failure alerts, e.g. "source data is stale", are sent by pipeline.py, not
+by this script.)
+
 Usage:
     python 03_send_email.py [--config config.ini]
 
@@ -17,12 +20,9 @@ Exit codes:
 import argparse
 import json
 import os
-import smtplib
 import sys
-from email.mime.multipart import MIMEMultipart
-from email.mime.text import MIMEText
 
-from common import load_config, setup_logging, get_bool
+from common import load_config, setup_logging, get_bool, send_smtp_message
 
 
 def load_status(status_path, logger):
@@ -55,13 +55,6 @@ def send_email(cfg, status, logger):
     with open(report_path, "r", encoding="utf-8") as f:
         report_text = f.read()
 
-    host = smtp_cfg.get("host", "").strip()
-    port = smtp_cfg.getint("port", fallback=587)
-    user = smtp_cfg.get("user", "").strip()
-    password = smtp_cfg.get("password", "").strip()
-    from_addr = smtp_cfg.get("from_addr", "").strip()
-    to_addrs = [addr.strip() for addr in smtp_cfg.get("to_addrs", "").split(",") if addr.strip()]
-
     # Subject line reflects the actual outcome instead of always saying
     # "Action Required" — configurable per case, with sensible defaults.
     if action_count > 0:
@@ -75,27 +68,12 @@ def send_email(cfg, status, logger):
             "SIPCA Tasks Review : All Clear, No Action Required",
         )
 
-    if not (host and user and password and from_addr and to_addrs):
-        logger.error(
-            "SMTP config incomplete. Check host, user, password, from_addr, "
-            "and to_addrs in config.ini under [smtp]."
-        )
-        sys.exit(1)
-
     try:
-        msg = MIMEMultipart("alternative")
-        msg["Subject"] = subject
-        msg["From"] = from_addr
-        msg["To"] = ", ".join(to_addrs)
-        msg.attach(MIMEText(report_text, "plain"))
-
-        with smtplib.SMTP(host, port, timeout=30) as server:
-            server.starttls()
-            server.login(user, password)
-            server.sendmail(from_addr, to_addrs, msg.as_string())
-
+        to_addrs = send_smtp_message(cfg, subject, report_text)
         logger.info(f"[✓] Email notification sent to: {', '.join(to_addrs)}")
-
+    except ValueError as e:
+        logger.error(str(e))
+        sys.exit(1)
     except Exception as e:
         logger.error(f"Failed to send email: {e}")
         sys.exit(2)

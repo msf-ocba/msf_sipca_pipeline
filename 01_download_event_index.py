@@ -9,25 +9,42 @@ Credentials come from config.ini (never hardcoded here). Supports either:
   - a full connection string, or
   - an account URL + SAS token
 
+Freshness check
+---------------
+Before downloading, the script reads the blob's last-modified time in Azure
+and stops with a clear error if the file is older than allowed. This prevents
+the review from silently running on old data when the upstream job that
+writes event_index.json has not run.
+
+  [azure]
+  ; 0 = must have been updated today, 1 = today or yesterday, etc.
+  ; off = disable the check
+  max_age_days = 0
+  ; decides what "today" means, e.g. Africa/Nairobi (default UTC)
+  freshness_timezone = UTC
+
 Usage:
-    python 01_download_event_index.py [--config config.ini]
+    python 01_download_event_index.py [--config config.ini] [--allow-stale]
 
 Exit codes:
     0 = success
     1 = config / credential problem
-    2 = download failure (network, missing blob, etc.)
+    2 = download failure (network, missing blob, etc.) OR stale blob
 """
 
 import argparse
 import os
 import sys
+from datetime import datetime, timezone
 
 from common import load_config, setup_logging
 
 try:
     from azure.storage.blob import BlobServiceClient
+    from azure.core.exceptions import ResourceNotFoundError
 except ImportError:
     BlobServiceClient = None  # handled below with a clear error message
+    ResourceNotFoundError = Exception
 
 
 def get_blob_client(cfg, logger):
@@ -61,25 +78,88 @@ def get_blob_client(cfg, logger):
     return blob_client, full_blob_path, container_name
 
 
-def download(cfg, logger):
-    blob_client, full_blob_path, container_name = get_blob_client(cfg, logger)
-    local_path = cfg["azure"].get("local_download_path", "./data/event_index.json").strip()
+def _get_timezone(name, logger):
+    """Return a tzinfo for the configured name; fall back to UTC with a warning."""
+    name = (name or "UTC").strip()
+    if name.upper() == "UTC":
+        return timezone.utc
+    try:
+        from zoneinfo import ZoneInfo
+        return ZoneInfo(name)
+    except Exception as e:
+        logger.warning(
+            f"Could not load timezone '{name}' ({e}); using UTC instead. "
+            "On Windows you may need: pip install tzdata"
+        )
+        return timezone.utc
 
+
+def check_freshness(props, full_blob_path, container_name, azure_cfg, logger):
+    """Exit with code 2 if the blob in Azure is older than max_age_days."""
+    raw = azure_cfg.get("max_age_days", "0").strip().lower()
+    if raw in ("off", "none", "false", "-1"):
+        logger.warning("Freshness check is disabled (max_age_days = off).")
+        return
+
+    try:
+        max_age_days = int(raw) if raw else 0
+    except ValueError:
+        logger.error(f"[azure] max_age_days must be a whole number or 'off', got: '{raw}'")
+        sys.exit(1)
+
+    tz = _get_timezone(azure_cfg.get("freshness_timezone", "UTC"), logger)
+    modified = props.last_modified.astimezone(tz)
+    today = datetime.now(tz).date()
+    age_days = (today - modified.date()).days
+    tz_label = modified.tzname() or str(tz)
+
+    logger.info(
+        f"Blob last modified in Azure: {modified:%Y-%m-%d %H:%M} {tz_label} "
+        f"({age_days} day(s) before today, {today})"
+    )
+
+    if age_days > max_age_days:
+        expected = "today" if max_age_days == 0 else f"within the last {max_age_days} day(s)"
+        logger.error(
+            f"STALE DATA: '{full_blob_path}' in container '{container_name}' was last "
+            f"updated in Azure on {modified:%Y-%m-%d %H:%M} {tz_label} "
+            f"({age_days} day(s) ago), but it should have been updated {expected} "
+            f"(today is {today}). The download itself works, so the upstream job that "
+            "writes this file has probably not run. Contact the OCBA datalake team. "
+            "The pipeline was stopped so the review does not run on old data."
+        )
+        sys.exit(2)
+
+
+def download(cfg, logger, allow_stale=False):
+    blob_client, full_blob_path, container_name = get_blob_client(cfg, logger)
+    azure_cfg = cfg["azure"]
+
+    local_path = azure_cfg.get("local_download_path", "./data/event_index.json").strip()
     local_dir = os.path.dirname(local_path)
     if local_dir:
         os.makedirs(local_dir, exist_ok=True)
 
-    logger.info(f"Downloading '{full_blob_path}' from container '{container_name}' -> {local_path}")
+    logger.info(f"Checking '{full_blob_path}' in container '{container_name}'")
 
     try:
-        if not blob_client.exists():
+        try:
+            props = blob_client.get_blob_properties()
+        except ResourceNotFoundError:
             logger.error(f"Blob not found: {full_blob_path} in container {container_name}")
             sys.exit(2)
 
+        if allow_stale:
+            logger.warning("--allow-stale given: skipping the freshness check.")
+        else:
+            check_freshness(props, full_blob_path, container_name, azure_cfg, logger)
+
+        logger.info(f"Downloading -> {local_path}")
         with open(local_path, "wb") as f:
             stream = blob_client.download_blob()
             stream.readinto(f)
-
+    except SystemExit:
+        raise
     except Exception as e:
         logger.error(f"Failed to download blob: {e}")
         sys.exit(2)
@@ -92,6 +172,11 @@ def download(cfg, logger):
 def main():
     parser = argparse.ArgumentParser(description="Download event_index.json from Azure Blob Storage")
     parser.add_argument("--config", default="config.ini", help="Path to config.ini")
+    parser.add_argument(
+        "--allow-stale",
+        action="store_true",
+        help="Download even if the blob is older than max_age_days (for testing/backfills)",
+    )
     args = parser.parse_args()
 
     cfg = load_config(args.config)
@@ -99,7 +184,7 @@ def main():
     logger = setup_logging(log_dir, "download")
 
     try:
-        download(cfg, logger)
+        download(cfg, logger, allow_stale=args.allow_stale)
     except SystemExit:
         raise
     except Exception as e:

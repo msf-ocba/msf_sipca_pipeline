@@ -1,14 +1,17 @@
 """
-Shared helpers for the SIPCA pipeline: config loading and logging setup.
-Keeping this in one place means download / review / email / pipeline
-scripts all behave consistently and log to the same place.
+Shared helpers for the SIPCA pipeline: config loading, logging setup and
+SMTP sending. Keeping this in one place means download / review / email /
+pipeline scripts all behave consistently and log to the same place.
 """
 
 import configparser
 import logging
 import logging.handlers
 import os
+import smtplib
 import sys
+from email.mime.multipart import MIMEMultipart
+from email.mime.text import MIMEText
 
 
 def load_config(config_path: str = "config.ini") -> configparser.ConfigParser:
@@ -20,7 +23,10 @@ def load_config(config_path: str = "config.ini") -> configparser.ConfigParser:
             f"Copy config.example.ini to {config_path} and fill in your real values.\n"
             f"(Example file expected at: {example})"
         )
-    parser = configparser.ConfigParser()
+    # interpolation=None: SAS tokens and passwords often contain '%' characters
+    # (e.g. %3D), which the default parser would try to treat as variable
+    # references and fail with "invalid interpolation syntax".
+    parser = configparser.ConfigParser(interpolation=None)
     parser.read(config_path)
     return parser
 
@@ -64,3 +70,40 @@ def get_bool(cfg: configparser.ConfigParser, section: str, key: str, default: bo
         return cfg.getboolean(section, key)
     except (configparser.NoSectionError, configparser.NoOptionError, ValueError):
         return default
+
+
+def send_smtp_message(cfg: configparser.ConfigParser, subject: str, body: str):
+    """
+    Send a plain-text email using the [smtp] section of config.ini.
+
+    Raises ValueError if the SMTP settings are incomplete; any other
+    exception (network, auth, ...) propagates so the caller can decide how
+    to handle it. Returns the list of recipients on success.
+    """
+    smtp_cfg = cfg["smtp"]
+
+    host = smtp_cfg.get("host", "").strip()
+    port = smtp_cfg.getint("port", fallback=587)
+    user = smtp_cfg.get("user", "").strip()
+    password = smtp_cfg.get("password", "").strip()
+    from_addr = smtp_cfg.get("from_addr", "").strip()
+    to_addrs = [addr.strip() for addr in smtp_cfg.get("to_addrs", "").split(",") if addr.strip()]
+
+    if not (host and user and password and from_addr and to_addrs):
+        raise ValueError(
+            "SMTP config incomplete. Check host, user, password, from_addr, "
+            "and to_addrs in config.ini under [smtp]."
+        )
+
+    msg = MIMEMultipart("alternative")
+    msg["Subject"] = subject
+    msg["From"] = from_addr
+    msg["To"] = ", ".join(to_addrs)
+    msg.attach(MIMEText(body, "plain", "utf-8"))
+
+    with smtplib.SMTP(host, port, timeout=30) as server:
+        server.starttls()
+        server.login(user, password)
+        server.sendmail(from_addr, to_addrs, msg.as_string())
+
+    return to_addrs
